@@ -1,0 +1,30 @@
+# IDE / Editor folders
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+.factorypath
+.metadata/
+
+# Build outputs
+target/
+**/target/
+build/
+**/build/
+dist/
+**/dist/
+out/
+**/out/
+
+# Dependency directories
+node_modules/
+**/node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log

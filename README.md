@@ -1,44 +1,260 @@
-# Event-Driven Order Processing Platform - Phase 2
+# Event-Driven Order Processing Platform
 
-This repository contains Phase 2 of the Event-Driven Order Processing Platform, implementing comprehensive failure handling, transactional Saga pattern compensation logic, Spring Kafka retry mechanisms with exponential backoff, Dead Letter Queue (DLQ) routing, a dedicated Notification Service, and deterministic simulation endpoints.
-
----
-
-## Architecture and Design Decisions
-
-This system uses a **choreographed Saga pattern** to maintain data consistency across distributed database schemas:
-
-1. **Order Service** creates orders with status `PENDING` and publishes an `order-created` event.
-2. **Inventory Service** consumes `order-created` and attempts to reserve stock:
-   - On success: Deducts stock, adds to reservations, and publishes `inventory-reserved`.
-   - On failure (out of stock or simulated): Publishes `inventory-failed`.
-3. **Payment Service** consumes `inventory-reserved` and attempts payment:
-   - On success: Saves payment details and publishes `payment-success`.
-   - On failure (simulated): Saves failed payment details and publishes `payment-failed`.
-4. **Saga Compensation**:
-   - **Inventory Service** consumes `payment-failed` and restores stock (`available_quantity += quantity`, `reserved_quantity -= quantity`).
-   - **Order Service`** consumes `payment-failed` and `inventory-failed` to update order status to `FAILED`.
-   - **Notification Service** consumes `payment-success` and `payment-failed` to store logs and simulate SMS & Email.
+A robust, enterprise-grade distributed order processing system built with **Spring Boot**, **Apache Kafka**, and **MySQL**. This platform demonstrates event-driven microservices architecture utilizing the **Choreographed Saga Pattern** for transaction management, Spring Kafka retry mechanisms with **exponential backoff**, **Dead Letter Queue (DLQ)** error handling, and a React-based interactive control panel.
 
 ---
 
-## Service Port Map
+## 1. System Architecture
 
-| Service | Port | Description | Database Schema |
-| :--- | :--- | :--- | :--- |
-| **Order Service** | `8081` | Rest API to place and track orders | `order_db` |
-| **Inventory Service** | `8082` | Rest API to view stock levels and toggle failure mode | `inventory_db` |
-| **Payment Service** | `8083` | Rest API to view payment transactions and toggle failure mode | `payment_db` |
-| **Notification Service** | `8084` | Rest API to view delivery notification logs | `notification_db` |
-| **Kafka Broker** | `9092` / `29092` | Event-driven message broker running in KRaft mode | N/A |
-| **MySQL Database** | `3307` (host) | Shared DB container containing dedicated schemas | N/A |
+The following diagram illustrates the relationship between the microservices, their dedicated databases, the Kafka message broker, and the React frontend test harness.
+
+```mermaid
+flowchart TB
+    %% Nodes
+    UI["Testing UI (React)<br>Port 5173 / Localhost"]
+    
+    subgraph Services ["Backend Microservices (Spring Boot)"]
+        Order["Order Service<br>Port 8081"]
+        Inv["Inventory Service<br>Port 8082"]
+        Pay["Payment Service<br>Port 8083"]
+        Notif["Notification Service<br>Port 8084"]
+    end
+    
+    subgraph Broker ["Message Bus"]
+        Kafka[("Kafka Broker<br>Port 9092 / 29092")]
+    end
+    
+    subgraph Storage ["Databases"]
+        DB_Order[("MySQL: order_db")]
+        DB_Inv[("MySQL: inventory_db")]
+        DB_Pay[("MySQL: payment_db")]
+        DB_Notif[("MySQL: notification_db")]
+    end
+
+    %% Connections
+    UI -->|HTTP / REST API| Order
+    UI -->|HTTP / REST API| Inv
+    UI -->|HTTP / REST API| Pay
+    UI -->|HTTP / REST API| Notif
+    
+    Order === DB_Order
+    Inv === DB_Inv
+    Pay === DB_Pay
+    Notif === DB_Notif
+
+    Order <-->|Publish / Consume Events| Kafka
+    Inv <-->|Publish / Consume Events| Kafka
+    Pay <-->|Publish / Consume Events| Kafka
+    Notif -->|Consume Events| Kafka
+```
 
 ---
 
-## API Documentation
+## 2. Choreographed Saga Pattern
 
-### 1. Order Service (`8081`)
-* **Create Order**: `POST /orders`
+To maintain data consistency across distributed database schemas, the system uses choreographed Saga execution. There is no central orchestrator; instead, services react to Kafka events published by each other.
+
+### Saga Workflows
+1. **Happy Path Workflow**: Successfully reserves inventory and processes payment, marking the order as `COMPLETED`.
+2. **Compensation Workflow (Payment Failed)**: Payment failure triggers compensations. Inventory is restored to its original state, and the order is marked as `FAILED`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Client / React UI
+    participant OS as Order Service
+    participant KB as Kafka Broker
+    participant IS as Inventory Service
+    participant PS as Payment Service
+    participant NS as Notification Service
+
+    Note over User, NS: Workflow A: Happy Path Saga
+    User->>OS: POST /orders
+    activate OS
+    OS->>OS: Create order (status: PENDING)
+    OS->>KB: Publish event: 'order-created'
+    deactivate OS
+    
+    activate IS
+    KB-->>IS: Consume: 'order-created'
+    IS->>IS: Reserve Stock (Deduct available, increment reserved)
+    IS->>KB: Publish event: 'inventory-reserved'
+    deactivate IS
+    
+    activate OS
+    KB-->>OS: Consume: 'inventory-reserved'
+    OS->>OS: Update status: INVENTORY_RESERVED
+    deactivate OS
+    
+    activate PS
+    KB-->>PS: Consume: 'inventory-reserved'
+    PS->>PS: Process Payment (Record transaction: SUCCESS)
+    PS->>KB: Publish event: 'payment-success'
+    deactivate PS
+    
+    activate OS
+    KB-->>OS: Consume: 'payment-success'
+    OS->>OS: Update status: COMPLETED
+    deactivate OS
+    
+    activate NS
+    KB-->>NS: Consume: 'payment-success'
+    NS->>NS: Store log & simulate Email/SMS dispatch
+    deactivate NS
+
+    Note over User, NS: Workflow B: Saga Compensation (Payment Failure Simulation)
+    User->>OS: POST /orders (simulatePaymentFailure = true)
+    activate OS
+    OS->>OS: Create order (status: PENDING)
+    OS->>KB: Publish: 'order-created'
+    deactivate OS
+    
+    activate IS
+    KB-->>IS: Consume: 'order-created'
+    IS->>IS: Reserve Stock (Deduct available, increment reserved)
+    IS->>KB: Publish: 'inventory-reserved'
+    deactivate IS
+    
+    activate PS
+    KB-->>PS: Consume: 'inventory-reserved'
+    PS->>PS: Intercept simulation flag -> Record transaction: FAILED
+    PS->>KB: Publish: 'payment-failed'
+    deactivate PS
+    
+    activate OS
+    KB-->>OS: Consume: 'payment-failed'
+    OS->>OS: Update status: FAILED
+    deactivate OS
+    
+    activate IS
+    KB-->>IS: Consume: 'payment-failed'
+    IS->>IS: Stock Compensation (Restore available, decrement reserved)
+    deactivate IS
+    
+    activate NS
+    KB-->>NS: Consume: 'payment-failed'
+    NS->>NS: Store log & alert email/SMS failure
+    deactivate NS
+```
+
+---
+
+## 3. Resilience: Retries & Dead Letter Queue (DLQ)
+
+If a service encounters a transient failure (e.g. database locks, transient connection drops, or when a service has **Failure Mode** toggled on), Spring Kafka's `CommonErrorHandler` schedules retries using an exponential backoff strategy before routing the event to a Dead Letter Topic (DLT).
+
+* **Retry Attempts**: 3 retries (4 total attempts)
+* **Backoff Configuration**: Initial interval of `1000ms`, multiplier `2.0`, max delay `4000ms` (Attempts at +0s, +1s, +3s, +7s)
+* **Dead Letter Routing**: On exhaustion, the event is routed to `payment-dlt`.
+* **DLT Persistence**: A dedicated `DltConsumer` reads from the DLT and saves failed event metadata into the `failed_events` DB table for audit/reconciliation.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant KB as Kafka Broker
+    participant PS as Payment Service
+    participant DLT as payment-dlt (DLQ Topic)
+    participant DC as DltConsumer
+    participant DB as payment_db (failed_events table)
+
+    KB-->>PS: Consume event (from inventory-reserved)
+    activate PS
+    Note over PS: Error occurs (e.g., Failure Mode Enabled)
+    PS-->>PS: Throw RuntimeException
+    deactivate PS
+    
+    Note over PS, KB: Spring Kafka ErrorHandler catches & schedules retries
+    
+    loop Exponential Backoff Retries
+        KB-->>PS: Retry #1 (1s delay)
+        activate PS
+        PS-->>PS: Fail (Exception)
+        deactivate PS
+        KB-->>PS: Retry #2 (2s delay)
+        activate PS
+        PS-->>PS: Fail (Exception)
+        deactivate PS
+        KB-->>PS: Retry #3 (4s delay)
+        activate PS
+        PS-->>PS: Fail (Exception)
+        deactivate PS
+    end
+
+    Note over KB, DLT: All retries exhausted
+    KB->>DLT: Router writes message to DLT
+    
+    activate DC
+    DLT-->>DC: Consume event from payment-dlt
+    DC->>DB: Persist details to failed_events table
+    deactivate DC
+```
+
+---
+
+## 4. Service Port & Database Map
+
+| Service | Host Port | Internal Container Port | Description | Database Schema |
+| :--- | :--- | :--- | :--- | :--- |
+| **Order Service** | `8081` | `8080` | Places and tracks orders. | `order_db` |
+| **Inventory Service** | `8082` | `8080` | Manages stock reservations and catalog. | `inventory_db` |
+| **Payment Service** | `8083` | `8080` | Processes transaction charges. | `payment_db` |
+| **Notification Service** | `8084` | `8080` | Logs simulated text messages and email notifications. | `notification_db` |
+| **Testing UI** | `5173` (Dev) | N/A | React-based visual client dashboard. | N/A |
+| **Kafka Broker** | `9092` | `29092` (Internal) | KRaft mode broker for message distribution. | N/A |
+| **MySQL Database** | `3307` | `3306` | Shared MySQL instance housing microservice schemas. | N/A |
+
+---
+
+## 5. Database Schema Structure
+
+All schemas are initialized automatically via [init.sql](file:///c:/Users/parth/OneDrive/Desktop/Event_driven%20Order%20Processing%20Platform/init-db/init.sql):
+
+### 1. `order_db`
+* **`orders`**: Tracks purchases.
+  - `id` (BIGINT, Primary Key)
+  - `product_id` (BIGINT)
+  - `quantity` (INT)
+  - `amount` (DECIMAL)
+  - `status` (`PENDING`, `INVENTORY_RESERVED`, `COMPLETED`, `FAILED`)
+  - `created_at` (DATETIME)
+
+### 2. `inventory_db`
+* **`inventory`**: Tracks stock quantities.
+  - `product_id` (BIGINT, Primary Key)
+  - `product_name` (VARCHAR)
+  - `available_quantity` (INT) - Stock available for sale
+  - `reserved_quantity` (INT) - Stock currently held for pending checkouts
+
+### 3. `payment_db`
+* **`payments`**: Tracks transaction attempts.
+  - `payment_id` (BIGINT, Primary Key)
+  - `order_id` (BIGINT)
+  - `amount` (DECIMAL)
+  - `status` (`SUCCESS`, `FAILED`)
+  - `created_at` (DATETIME)
+* **`failed_events`**: DLQ persistence audit log.
+  - `id` (BIGINT, Primary Key)
+  - `event_id` (VARCHAR)
+  - `topic_name` (VARCHAR)
+  - `payload` (TEXT)
+  - `error_message` (TEXT)
+  - `failed_at` (DATETIME)
+
+### 4. `notification_db`
+* **`notifications`**: Logs communications dispatched to users.
+  - `id` (BIGINT, Primary Key)
+  - `order_id` (BIGINT)
+  - `event_type` (VARCHAR)
+  - `message` (VARCHAR)
+  - `status` (VARCHAR)
+  - `created_at` (DATETIME)
+
+---
+
+## 6. API Reference
+
+### Order Service (`8081`)
+* `POST /orders`: Place a new order.
   ```json
   {
     "productId": 1,
@@ -48,43 +264,39 @@ This system uses a **choreographed Saga pattern** to maintain data consistency a
     "simulatePaymentFailure": false
   }
   ```
-* **Get All Orders**: `GET /orders`
-* **Get Order by ID**: `GET /orders/{id}`
+* `GET /orders`: Fetch all orders.
+* `GET /orders/{id}`: Fetch single order state.
 * **Swagger UI**: http://localhost:8081/swagger-ui.html
 
-### 2. Inventory Service (`8082`)
-* **Get All Stock Levels**: `GET /inventory`
-* **Toggle Failure Mode**: `PUT /inventory/failure-mode`
+### Inventory Service (`8082`)
+* `GET /inventory/products`: Retrieve catalog products & current stock.
+* `PUT /inventory/failure-mode`: Toggle failure mode on/off.
   ```json
-  {
-    "enabled": true
-  }
+  { "enabled": true }
   ```
 * **Swagger UI**: http://localhost:8082/swagger-ui.html
 
-### 3. Payment Service (`8083`)
-* **Get All Payments**: `GET /payments`
-* **Toggle Failure Mode**: `PUT /payments/failure-mode`
+### Payment Service (`8083`)
+* `GET /payments`: Fetch transaction database records.
+* `PUT /payments/failure-mode`: Toggle runtime payment exception generation on/off.
   ```json
-  {
-    "enabled": true
-  }
+  { "enabled": true }
   ```
 * **Swagger UI**: http://localhost:8083/swagger-ui.html
 
-### 4. Notification Service (`8084`)
-* **Get All Notifications**: `GET /notifications`
-* **Get Notifications by Order**: `GET /notifications/order/{orderId}`
+### Notification Service (`8084`)
+* `GET /notifications`: Retrieve dispatch log records.
+* `GET /notifications/order/{orderId}`: Get notifications by order number.
 * **Swagger UI**: http://localhost:8084/swagger-ui.html
 
 ---
 
-## Step-by-Step Testing Scenarios
+## 7. Step-by-Step Testing Scenarios
 
-Use the following HTTP requests to verify the implementation after starting the containers.
+You can verify the choreography, compensations, and DLQ logic by executing these scenarios using the React UI or using HTTP clients (curl/Postman):
 
 ### Scenario 1: Happy Path Execution
-1. Send request:
+1. Send an order request:
    ```bash
    POST http://localhost:8081/orders
    {
@@ -95,16 +307,10 @@ Use the following HTTP requests to verify the implementation after starting the 
      "simulatePaymentFailure": false
    }
    ```
-2. Verify:
-   - Order status goes from `PENDING` -> `INVENTORY_RESERVED` -> `COMPLETED`.
-   - Inventory: available stock drops by 5, reserved stock is incremented by 5 during processing, and remains reserved upon successful checkout.
-   - Payment logs: SUCCESS log created in `payment_db`.
-   - Notifications: A log is generated in `notification_db` stating: `"Payment successful for Order X"`. Check email and SMS simulations in logs.
-
----
+2. **Result**: Order status transitions `PENDING` -> `INVENTORY_RESERVED` -> `COMPLETED`. Database shows stock deducted by 5 and a successful payment.
 
 ### Scenario 2: Out of Stock (Natural Inventory Failure)
-1. Product 1 starts with 100 available stock. Send a request that exceeds the available stock limit:
+1. Request a quantity that exceeds stock limit (e.g. initial stock of Gaming Laptop is 100):
    ```bash
    POST http://localhost:8081/orders
    {
@@ -113,14 +319,10 @@ Use the following HTTP requests to verify the implementation after starting the 
      "amount": 360000
    }
    ```
-2. Verify:
-   - Inventory Service publishes `inventory-failed` without modifying database stock values.
-   - Order Service receives the event and updates Order status to `FAILED`.
-
----
+2. **Result**: Inventory Service publishes `inventory-failed`. Order Service consumes the event and updates Order status directly to `FAILED`. No database stock modifications occur.
 
 ### Scenario 3: Simulated Inventory Failure
-1. Send request:
+1. Submit an order with `simulateInventoryFailure: true`:
    ```bash
    POST http://localhost:8081/orders
    {
@@ -130,15 +332,10 @@ Use the following HTTP requests to verify the implementation after starting the 
      "simulateInventoryFailure": true
    }
    ```
-2. Verify:
-   - Inventory Service intercepts simulation flag, bypasses reservation, and publishes `inventory-failed`.
-   - Order status is set to `FAILED`.
-   - No stock deduction occurs in `inventory_db`.
-
----
+2. **Result**: Inventory Service consumes `order-created`, bypasses reservation logic because of the flag, and publishes `inventory-failed`. Order transitions to `FAILED` with no stock held.
 
 ### Scenario 4: Simulated Payment Failure & Saga Compensation
-1. Send request:
+1. Submit an order with `simulatePaymentFailure: true`:
    ```bash
    POST http://localhost:8081/orders
    {
@@ -148,26 +345,19 @@ Use the following HTTP requests to verify the implementation after starting the 
      "simulatePaymentFailure": true
    }
    ```
-2. Verify:
-   - Inventory Service successfully reserves stock: Available decreases by 10, Reserved increases by 10. Publishes `inventory-reserved`.
+2. **Flow**:
+   - Stock is successfully reserved (Available stock drops by 10, Reserved stock increases by 10).
    - Order Service updates status to `INVENTORY_RESERVED`.
-   - Payment Service consumes the reservation, checks the simulation flag, marks payment status as `FAILED` in `payments` table, and publishes `payment-failed`.
-   - **Compensation**:
-     - Inventory Service consumes `payment-failed` and restores stock: Available increases by 10, Reserved decreases by 10.
-     - Order Service consumes `payment-failed` and updates status to `FAILED`.
-     - Notification Service consumes `payment-failed` and logs `"Payment failed for Order X"`. Simulated SMS and Email logs are written to stdout.
-
----
+   - Payment Service consumes the event, intercepts the simulation flag, writes a `FAILED` record, and publishes `payment-failed`.
+   - **Compensation**: Inventory Service consumes `payment-failed` and restores stock (Available stock increases by 10, Reserved stock decreases by 10). Order Service transitions status to `FAILED`.
 
 ### Scenario 5: Retries, Exponential Backoff, and Dead Letter Queue (DLQ)
-1. Enable failure mode on Payment Service:
+1. Toggle Payment Service **Failure Mode** on:
    ```bash
    PUT http://localhost:8083/payments/failure-mode
-   {
-     "enabled": true
-   }
+   { "enabled": true }
    ```
-2. Submit a normal checkout request:
+2. Submit a standard order:
    ```bash
    POST http://localhost:8081/orders
    {
@@ -176,12 +366,30 @@ Use the following HTTP requests to verify the implementation after starting the 
      "amount": 2500
    }
    ```
-3. Verify:
-   - Inventory is reserved normally.
-   - Payment Service consumes the reservation. Since failure mode is enabled, it throws a `RuntimeException`.
-   - Spring Kafka's `CommonErrorHandler` catches the exception and schedules retries:
-     - **Attempt 1**: Delay = 1 second
-     - **Attempt 2**: Delay = 2 seconds
-     - **Attempt 3**: Delay = 4 seconds
-   - After the 3rd retry attempt fails, the event is routed to the DLT topic `payment-dlt`.
-   - **DLQ Consumer**: `DltConsumer` in `payment-service` reads the failed message from `payment-dlt` and persists details into the `failed_events` database table (including original payload, event UUID, topic, error message, and timestamp).
+3. **Flow**: Inventory is reserved. Payment Service consumes the reservation, throws a `RuntimeException` (due to Failure Mode), and triggers retries at +1s, +2s, and +4s.
+4. **DLQ Outcome**: After the 4th failed attempt, the event is routed to `payment-dlt`. The `DltConsumer` reads this event and inserts a record into the `failed_events` database audit table.
+
+---
+
+## 8. Installation & Getting Started
+
+### Prerequisites
+- Docker & Docker Compose
+- Node.js (v18+) & npm
+
+### Running the Services
+1. **Start the Infrastructure and Microservices**:
+   Run the following command in the root folder (where `docker-compose.yml` is located):
+   ```bash
+   docker-compose up --build
+   ```
+   *Note: This command compiles all the Java services, packages them into Docker layers, and starts MySQL, Kafka, and the four spring boot service containers. It might take a few minutes on the first run.*
+
+2. **Start the React Control Panel Dashboard**:
+   Navigate to the frontend directory:
+   ```bash
+   cd testing-ui
+   npm install
+   npm run dev
+   ```
+   Open the displayed localhost URL (usually `http://localhost:5173`) in your browser to interactively create orders, toggle failures, and watch Kafka events flow in real-time.

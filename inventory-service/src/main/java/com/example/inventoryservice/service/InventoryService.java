@@ -36,8 +36,19 @@ public class InventoryService {
                 event.getOrderId(), event.getProductId(), event.getQuantity());
 
         if (failureModeEnabled) {
-            log.warn("Failure mode enabled in Inventory Service. Throwing retryable exception for order: {}", event.getOrderId());
-            throw new RuntimeException("Simulated retryable error in Inventory Service");
+            log.warn("Failure mode enabled in Inventory Service. Publishing inventory-failed event for order: {}", event.getOrderId());
+            OrderEvent failedEvent = OrderEvent.builder()
+                    .eventId(event.getEventId())
+                    .orderId(event.getOrderId())
+                    .productId(event.getProductId())
+                    .quantity(event.getQuantity())
+                    .amount(event.getAmount())
+                    .status("FAILED")
+                    .simulateInventoryFailure(event.getSimulateInventoryFailure())
+                    .simulatePaymentFailure(event.getSimulatePaymentFailure())
+                    .build();
+            inventoryEventProducer.publishInventoryFailed(failedEvent);
+            return;
         }
 
         Inventory inventory = inventoryRepository.findById(event.getProductId())
